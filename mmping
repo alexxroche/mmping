@@ -1,0 +1,257 @@
+#!/bin/bash
+# mmping ver. 20250213102832 Copyright 2025 alexx, MIT License
+# RDFa:deps="[ip sudo]"
+# RDFa:function="multi metric ping: ping out from multiple interfaces"
+# RDFa:presumes="default gateway is the same for each interface"
+# RDFa:presumes="each route has a unique metric"
+# RDFa:presumes="each route metric is a modulo 100"
+# RDFa:presumes="fewer than 10 routes"
+  # TODO TEST trap exit to reset 
+  # TODO full IPv6 support
+  # TODO set metrics to modulo 100 remainder zero (if they aren't.)
+script_name="$(basename "$0")"
+usage(){ printf "Usage: %s [-h|-d]\n\t -h This help message\n -d dry run\n" \
+"$script_name"; exit 0;}
+[ "$1" ]&& echo "$1"|grep -q '\-h' && usage
+
+debug=0
+dry_run=0
+
+# check if this is being called as a dry_run
+[ "$1" ]&& echo "$1"|grep -q '\-d' && { dry_run=1; shift; }
+
+
+current_routing_table="$(ip -4 r|grep -v default|sort -k11)"
+# largest metric
+last_m="$(printf "%s" "$current_routing_table"|tail -n1|awk '{print $NF}')"
+
+
+# default gateway
+dg4='192.168.1.1' # default gateway_v4
+dg6='3fff::2001:db8:1' # default gateway_v6
+arg_cmd=0
+if [ "$1" ]&& printf "%s" "$1"|grep -q ':'; then
+  dg6="$1"; arg_cmd=6
+elif [ "$1" ]&& printf "%s" "$1"|grep -q '\.'; then
+  dg4="$1"; arg_cmd=4;
+fi
+
+# not sure if we favour cut or awk, or have one as a fallback?
+gateway_v4="$(ip -4 r|grep default|cut -d' ' -f3|head -n1|grep . || printf "%s" "$dg4")"
+gateway_v6="$(ip -6 r|grep default|awk '{print $3}'|head -n1|grep : || printf "%s" "$dg6")"
+
+[ "$arg_cmd" ]&&[ "$arg_cmd" -gt 0 ]&& {
+  gateway_v4="$(printf "%s" "$dg4")"
+  gateway_v6="$(printf "%s" "$dg6")"
+}
+
+say(){ printf "[i] %s\n" "$*" >&2; }
+leave(){ [ "$2" ] && say "$2"; exit "$1"; }
+
+sanity(){
+  # check that we have `iproute2` installed
+  [ "$(which ip)" ]|| leave 1 "$script_name depends on 'ip' from iproute2"
+
+  ## check that we have multiple `routes`
+  [ "$({ ip -6 r;ip -4 r; }|grep -vc ^default)" -gt 3 ]|| leave 2 "$script_name requires multiple (non-default) routes"
+
+  ## check that each route has a unique metric
+  ## check that each route metric is modulo 100 with zero remainder
+  if [ "$arg_cmd" ]&&[ "$arg_cmd" -ge 6 ]; then
+    # number of routes
+    nor="$(ip -6 r|grep -cv default)"
+    # previous metric
+    pm=0
+    for i in $(seq 1 "$nor"); do
+      this_m="$(ip -6 r|grep -v default|sort -k11|head -n$i|tail -n1|awk '{print $NF}')"
+      [ "$( echo "$this_m"|cut -c2-)" -eq 0 ]|| leave 6 "route '$i' has a metric is $this_m; which isn't modulo 100"
+      [ "$this_m" -ne "$pm" ]&& pm="$this_m" || leave 7 "route '$i' has the same metric as the previous one"
+    done
+  else # ipv4
+    # number of routes
+    nor="$(ip -4 r|grep -cv default)"
+    # previous metric
+    pm=0
+    for i in $(seq 1 "$nor"); do
+      this_m="$(ip -4 r|grep -v default|sort -k11|head -n$i|tail -n1|awk '{print $NF}')"
+      [ "$( echo "$this_m"|cut -c2-)" -eq 0 ]|| leave 4 "route '$i' has a metric is $this_m; which isn't modulo 100"
+      [ "$this_m" -ne "$pm" ]&& pm="$this_m" || leave 5 "route '$i' has the same metric as the previous one"
+    done
+  fi
+}
+
+# verify that we have all that we need
+#  and that we can use the current routing table
+sanity
+
+
+rotate_route(){
+  crt="$(ip -4 r|grep -v default|sort -k11)"
+  # routes
+  top="$(printf "%s" "$crt"|head -n1)"
+  # current metric
+  top_m="$(printf "%s" "$top"|awk '{print $NF}')"
+  top_s="$(printf "%s" "$top"|cut -d' ' -f1-9)"
+
+  # move the top to the bottom
+  [ "$dry_run" ]&&[ "$dry_run" -eq 1 ]&& say "Moving $top below $last_m"
+  [ "$dry_run" ]&&[ "$dry_run" -eq 0 ]&& {
+	sudo ip route replace $top_s metric $(( last_m + ( top_m / 10 ) ))
+	sudo ip route del $top
+  }
+}
+
+ping_from_top_route(){
+	# ping from the interface with the lowest metric
+	this_gateway="$1"
+  this_if="$(ip -4 r|grep -v ^default|head -n1|awk '{print $3}')"
+  this_alt="$(ip a s "$(ip -4 r|grep -v ^default|head -n1|awk '{print $3}')"|grep altname|head -n1|awk '{print $NF}')"
+  #this_alt="$(ip l sh "$(ip -4 r|grep -v ^default|head -n1|awk '{print $3}')"|grep altname|head -n1|awk '{print $NF}')"
+  [ "$this_gateway" ]&& echo "$this_gateway"|grep -q '\.' || this_gateway=$gateway_v6
+
+  if_name="$(
+    if [ "$this_alt" ]&& echo "$this_alt"|grep -q .; then
+      # check that the destination is reachable from that interface
+      if [ "$(check_neighbour_reachable $this_if)" ]; then
+        printf "%s (%s)" "$this_if" "$this_alt"
+      else
+        say "skipping $this_if ($this_alt) as $this_gateway is unreachable";
+      fi
+    else
+      if [ "$(check_neighbour_reachable $this_if)" ]; then
+        printf "%s" "$this_if"
+      else
+        say "skipping $this_if as $this_gateway is unreachable";
+      fi
+    fi)"
+  [ ! "$if_name" ]||[ "${#if_name}" -le 2 ]&&{
+    [ "$debug" ] && say "$if_name is down for $this_if [${#if_name}]"
+    return
+  }
+  ping_cmd="$(
+    if [ "$arg_cmd" ]&&[ "$arg_cmd" -ge 6 ]; then
+      which ping6 || leave 8 "unable to locate ping6"
+    else
+      which ping || leave 9 "how is ping missing??"
+    fi)"
+
+	[ "$dry_run" ]&&[ "$dry_run" -eq 1 ] &&
+	 say "[dry_run:$if_name] $ping_cmd -c1 -w1 -W1 $this_gateway"
+	[ "$dry_run" ]&&[ "$dry_run" -eq 0 ] &&
+   printf "%s > %s %s\n" "$if_name" "$this_gateway" \
+   "$($ping_cmd -c1 -w1 -W1 "$this_gateway" |grep trip)"
+}
+
+reset_route_metric(){
+  # current routing table
+  crt="$(ip -4 r|grep -v default|sort -k11)"
+  ### top interface (to reset)
+  top="$(printf "%s" "$crt"|head -n2|tail -n1)"
+  # current metric
+  top_m="$(printf "%s" "$top"|awk '{print $NF}')"
+  top_s="$(printf "%s" "$top"|cut -d' ' -f1-9)"
+  # extract the old metric from the current metric
+  old_m="$( echo "scale=0;$top_m%100"|bc -l)0"
+  [ "$old_m" ]&& [ "$old_m" -gt 0 ]|| old_m=100
+  [ "$debug" ]&&[ "$debug" -gt 2 ]&& say "[d] found top metric: $top_m and changing back to $old_m"
+  sudo ip route replace $top_s metric $old_m
+  sudo ip route del $top_s metric $top_m
+}
+
+reset_all_routes(){
+  # number of routes that need resetting
+  nrtnr=0
+  # find out how many need resetting
+  all_m="$(ip -4 r|grep -v ^default|awk '{print $NF}')"
+  # while one of the metric isn't `modulo 100 remainder zero`
+  rotated_metric="$( echo "$all_m"|while read -r m; do [ "$(echo "scale=0;$m%100"|bc -l)" -eq 0 ]|| echo "$m"; done)"
+  nrtnr="$( echo "$rotated_metric"|wc -l)"
+  if [ "$nrtnr" ]&&[ "$nrtnr" -gt 0 ]; then
+    for i in $(seq 2 "$nrtnr"); do
+      reset_route_metric "$i"
+    done
+  fi
+}
+
+main(){
+  # overview: we want to rotate_route for n-1 interfaces with a ping sent
+  #  between each rotation;
+  # if we have metrics of: [100,200,400,600]; then we rotate them by step to:
+  #  [200,400,600,610]
+  #  [400,600,610,620]
+  #  [600,610,620,640] # no need to rotate the last interface as it has bubbled to the top
+  #
+  # and then reset each one that was changed:
+  #  [100,600,620,640]
+  #  [100,200,600,640]
+  #  [100,200,400,600]
+  #
+  # will fail if the metrics aren't "modulo 100 remainder zero"
+
+  # rotate+ping for n-1 interfaces
+  if [ "$arg_cmd" ]&&[ "$arg_cmd" -ge 6 ]; then
+    # number of routes
+    nor="$(ip -6 r|grep -cv default)"
+    for i in $(seq 2 "$nor"); do
+      ping_from_top_route "$gateway_v6" &
+      rotate_route "$i"
+    done
+    # and ping the unrotated route
+    ping_from_top_route "$gateway_v6" &
+    # reset for n-1 interfaces
+    for i in $(seq 2 "$nor"); do
+      reset_route_metric "$i"
+    done
+  else # ipv4
+    # number of routes
+    nor="$(ip -4 r|grep -cv default)"
+    for i in $(seq 2 "$nor"); do
+      ping_from_top_route "$gateway_v4" &
+      rotate_route
+    done
+    # and ping the unrotated route
+    ping_from_top_route "$gateway_v4" &
+    # reset for n-1 interfaces
+    for i in $(seq 2 "$nor"); do
+      reset_route_metric "$i"
+    done
+  fi
+}
+
+check_link_state(){
+    # expects a link interface or altname
+    ip l sh "$1"|tr ' ' '\n'|grep -A1 state|tail -n1
+}
+
+report_all_link_states(){
+  ip r|grep def|awk '{print $5}'|while read -r i; do
+    printf "%s   \t" "$i"; check_link_state "$i"
+  done
+}
+
+check_neighbour_reachable(){
+  # expects interface
+  # it would be nice to skip a ping attempt if the connection is down
+  ip a s dev "$1"|grep inet
+  # expects [protocol, interface] e.g. [-4, eth0] or [-6, wlan0]
+  #ip $1 n s dev "$2"|awk '{print $NF}'
+}
+
+# say "$current_routing_table"
+
+check_all_neighbour_reachable(){
+  #for i in $(ip l|grep '^[[:digit:]*]:'|cut -d: -f2|grep -v lo); do
+  ip l|grep '^[[:digit:]*]:'|cut -d: -f2|grep -v lo|while read -r i; do
+    [ "$(check_neighbour_reachable "$i")" ]&& say "$i reachable" || say "$i in DHCP purgetory"
+  done
+}
+#check_all_neighbour_reachable
+# if we exit early then undo the swaps
+trap reset_all_routes EXIT
+main
+
+# check that things are back as they were, or "REPORT!"
+crt="$(ip -4 r|grep -v default|sort -k11)"
+printf "%s" "$crt"|grep -q "^$current_routing_table$" \
+  || leave 3 "ort: $current_routing_table ; \n crt: $crt"
+
